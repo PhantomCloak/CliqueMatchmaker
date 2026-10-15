@@ -489,8 +489,8 @@ public partial class Matchmaker : IDisposable
             return new();
         }
 
-        var matched = Sweep(activeIndexesCopy, indexesCopy, now ?? DateTime.UtcNow, out var expiredTickets);
-        var seated = new List<List<MatchmakerTicket>>(matched.Count);
+        var foundMatches = Sweep(activeIndexesCopy, indexesCopy, now ?? DateTime.UtcNow, out var expiredTickets);
+        var seated = new List<List<MatchmakerTicket>>(foundMatches.Count);
 
         lock (_m)
         {
@@ -499,7 +499,7 @@ public partial class Matchmaker : IDisposable
                 _activeIndexes.Remove(ticket);
             }
 
-            foreach (var match in matched)
+            foreach (var match in foundMatches)
             {
                 // a ticket cancelled while the sweep ran unseats its lobby; the rest stay queued for the next sweep
                 if (!match.All(ticket => _indexes.ContainsKey(ticket.Ticket)))
