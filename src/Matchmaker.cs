@@ -56,8 +56,16 @@ public partial class Matchmaker : IDisposable
 
     readonly MatchmakerConfig _config;
 
-    public int PoolSize => _indexes.Count;
-    public int ActivePoolSize => _activeIndexes.Count;
+    readonly Lock _m = new();
+
+    public int PoolSize
+    {
+        get { lock (_m) { return _indexes.Count; } }
+    }
+    public int ActivePoolSize
+    {
+        get { lock (_m) { return _activeIndexes.Count; } }
+    }
     public MatchmakerConfig Config => _config;
 
     private readonly int _maxLadderRungs;
@@ -88,14 +96,20 @@ public partial class Matchmaker : IDisposable
 
 
     public (string Ticket, long CreatedAt) Add(HashSet<string> sessionIds, string ownerSessionId, string partyId, string query, Dictionary<string, object> properties, MinMaxRung[] minMaxLadder, int countMultiple = 1, DateTime? createdAt = null) =>
-         AddTicket(sessionIds, ownerSessionId, partyId, [(0, query)], properties, minMaxLadder, _maxLadderRungs, countMultiple, createdAt);
+         Add(sessionIds, ownerSessionId, partyId, [(0, query)], properties, minMaxLadder, countMultiple, createdAt);
 
-    public (string Ticket, long CreatedAt) Add(HashSet<string> sessionIds, string ownerSessionId, string partyId, QueryRung[] queryLadder, Dictionary<string, object> properties, MinMaxRung[] minMaxLadder, int countMultiple = 1, DateTime? createdAt = null) =>
-         AddTicket(sessionIds, ownerSessionId, partyId, queryLadder, properties, minMaxLadder, _maxLadderRungs, countMultiple, createdAt);
+    public (string Ticket, long CreatedAt) Add(HashSet<string> sessionIds, string ownerSessionId, string partyId, QueryRung[] queryLadder, Dictionary<string, object> properties, MinMaxRung[] minMaxLadder, int countMultiple = 1, DateTime? createdAt = null)
+    {
+        lock (_m)
+        {
+            return AddTicket(sessionIds, ownerSessionId, partyId, queryLadder, properties, minMaxLadder, _maxLadderRungs, countMultiple, createdAt);
+        }
+    }
 
     public (string Ticket, long CreatedAt) AddBackfill(HashSet<string> sessionIds, string ownerSessionId, string partyId, string query, Dictionary<string, object> properties, MinMaxRung[] minMaxLadder, int countMultiple = 1, DateTime? createdAt = null) =>
         AddBackfill(sessionIds, ownerSessionId, partyId, [(0, query)], properties, minMaxLadder, countMultiple, createdAt);
  
+    // callers hold _gate: the checks below and the writes after them are one step
     private (string Ticket, long CreatedAt) AddTicket(HashSet<string> sessionIds, string ownerSessionId, string partyId, QueryRung[] queryLadder, Dictionary<string, object> properties, MinMaxRung[] minMaxLadder, int minMaxRungCap, int countMultiple, DateTime? createdAt)
     {
         if (queryLadder.Length == 0 || minMaxLadder.Length == 0)
@@ -461,8 +475,14 @@ public partial class Matchmaker : IDisposable
 
     public List<List<MatchmakerTicket>> RunSweep(DateTime? now = null)
     {
-        var activeIndexesCopy = new Dictionary<string, MatchmakerTicket>(_activeIndexes);
-        var indexesCopy = new Dictionary<string, MatchmakerTicket>(_indexes);
+        Dictionary<string, MatchmakerTicket> activeIndexesCopy;
+        Dictionary<string, MatchmakerTicket> indexesCopy;
+
+        lock (_m)
+        {
+            activeIndexesCopy = new Dictionary<string, MatchmakerTicket>(_activeIndexes);
+            indexesCopy = new Dictionary<string, MatchmakerTicket>(_indexes);
+        }
 
         if (activeIndexesCopy.Count == 0)
         {
@@ -470,21 +490,32 @@ public partial class Matchmaker : IDisposable
         }
 
         var matched = Sweep(activeIndexesCopy, indexesCopy, now ?? DateTime.UtcNow, out var expiredTickets);
+        var seated = new List<List<MatchmakerTicket>>(matched.Count);
 
-        foreach (var ticket in expiredTickets)
+        lock (_m)
         {
-            _activeIndexes.Remove(ticket);
-        }
-
-        foreach (var match in matched)
-        {
-            foreach (var matchIndex in match)
+            foreach (var ticket in expiredTickets)
             {
-                RemoveTicket(matchIndex.Ticket);
+                _activeIndexes.Remove(ticket);
+            }
+
+            foreach (var match in matched)
+            {
+                // a ticket cancelled while the sweep ran unseats its lobby; the rest stay queued for the next sweep
+                if (!match.All(ticket => _indexes.ContainsKey(ticket.Ticket)))
+                {
+                    continue;
+                }
+
+                foreach (var matchIndex in match)
+                {
+                    RemoveTicket(matchIndex.Ticket);
+                }
+                seated.Add(match);
             }
         }
 
-        return matched;
+        return seated;
     }
 
     public void FlushStaleTickets()
@@ -492,27 +523,30 @@ public partial class Matchmaker : IDisposable
         long nowSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         long maxAgeSeconds = _config.TicketMaxTTLInMinute * 60L;
 
-        List<string>? stale = null;
-        foreach (var (ticketId, ticket) in _indexes)
+        lock (_m)
         {
-            long createdAtSeconds = ticket.CreatedAt / 1_000_000_000;
-            if (nowSeconds - createdAtSeconds < maxAgeSeconds)
+            List<string>? stale = null;
+            foreach (var (ticketId, ticket) in _indexes)
             {
-                continue;
+                long createdAtSeconds = ticket.CreatedAt / 1_000_000_000;
+                if (nowSeconds - createdAtSeconds < maxAgeSeconds)
+                {
+                    continue;
+                }
+
+                stale ??= new List<string>();
+                stale.Add(ticketId);
             }
 
-            stale ??= new List<string>();
-            stale.Add(ticketId);
-        }
+            if (stale == null)
+            {
+                return;
+            }
 
-        if (stale == null)
-        {
-            return;
-        }
-
-        foreach (var ticketId in stale)
-        {
-            CancelTicket(ticketId);
+            foreach (var ticketId in stale)
+            {
+                CancelTicket(ticketId);
+            }
         }
     }
 
@@ -655,22 +689,26 @@ public partial class Matchmaker : IDisposable
     private HashSet<string> CollectAllTicketsInMatch(List<MatchmakerTicket> match)
     {
         HashSet<string> consumedTickets = new();
-        foreach (var ticketIndex in match)
-        {
-            foreach (var sessionId in ticketIndex.Members)
-            {
-                if (!_sessionTickets.TryGetValue(sessionId, out var memberTickets) || memberTickets.Count <= 1)
-                {
-                    continue;
-                }
 
-                foreach (var ticket in memberTickets)
+        lock (_m)
+        {
+            foreach (var ticketIndex in match)
+            {
+                foreach (var sessionId in ticketIndex.Members)
                 {
-                    if (ticket == ticketIndex.Ticket) continue;
-                    consumedTickets.Add(ticket);
+                    if (!_sessionTickets.TryGetValue(sessionId, out var memberTickets) || memberTickets.Count <= 1)
+                    {
+                        continue;
+                    }
+
+                    foreach (var ticket in memberTickets)
+                    {
+                        if (ticket == ticketIndex.Ticket) continue;
+                        consumedTickets.Add(ticket);
+                    }
                 }
+                consumedTickets.Add(ticketIndex.Ticket);
             }
-            consumedTickets.Add(ticketIndex.Ticket);
         }
 
         return consumedTickets;
@@ -678,48 +716,51 @@ public partial class Matchmaker : IDisposable
 
     public bool CancelTicket(string ticketId)
     {
-        if (!_indexes.TryGetValue(ticketId, out var index))
+        lock (_m)
         {
-            return false;
-        }
-
-        var cancelling = new HashSet<string> { ticketId };
-
-        if (index.PartyId != "")
-        {
-            foreach (var sessionId in index.Members)
+            if (!_indexes.TryGetValue(ticketId, out var index))
             {
-                if (_sessionTickets.TryGetValue(sessionId, out var sessionTickets))
+                return false;
+            }
+
+            var cancelling = new HashSet<string> { ticketId };
+
+            if (index.PartyId != "")
+            {
+                foreach (var sessionId in index.Members)
                 {
-                    cancelling.UnionWith(sessionTickets);
+                    if (_sessionTickets.TryGetValue(sessionId, out var sessionTickets))
+                    {
+                        cancelling.UnionWith(sessionTickets);
+                    }
+                }
+                _partySessions.Remove(index.PartyId);
+            }
+
+            foreach (var cancelled in cancelling)
+            {
+                if (_indexes.TryGetValue(cancelled, out var cancelledIndex))
+                {
+                    RemoveIndex(cancelledIndex);
                 }
             }
-            _partySessions.Remove(index.PartyId);
-        }
 
-        foreach (var cancelled in cancelling)
-        {
-            if (_indexes.TryGetValue(cancelled, out var cancelledIndex))
+            foreach (var sessionId in index.Members)
             {
-                RemoveIndex(cancelledIndex);
-            }
-        }
+                if (!_sessionTickets.TryGetValue(sessionId, out var sessionTickets))
+                {
+                    continue;
+                }
 
-        foreach (var sessionId in index.Members)
-        {
-            if (!_sessionTickets.TryGetValue(sessionId, out var sessionTickets))
-            {
-                continue;
+                sessionTickets.ExceptWith(cancelling);
+                if (sessionTickets.Count == 0)
+                {
+                    _sessionTickets.Remove(sessionId);
+                }
             }
 
-            sessionTickets.ExceptWith(cancelling);
-            if (sessionTickets.Count == 0)
-            {
-                _sessionTickets.Remove(sessionId);
-            }
+            return true;
         }
-
-        return true;
     }
 
     private void RemoveTicket(string ticketId)
