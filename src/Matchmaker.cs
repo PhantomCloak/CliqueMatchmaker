@@ -55,6 +55,7 @@ public partial class Matchmaker : IDisposable
     readonly Dictionary<string, HashSet<string>> _partySessions = new();
 
     readonly MatchmakerConfig _config;
+    readonly ITicketStore? _store;
 
     readonly Lock _m = new();
 
@@ -72,9 +73,10 @@ public partial class Matchmaker : IDisposable
 
     private long _lastCreatedAt;
 
-    public Matchmaker(MatchmakerConfig? config = null)
+    public Matchmaker(MatchmakerConfig? config = null, ITicketStore? store = null)
     {
         _config = config ?? new MatchmakerConfig();
+        _store = store;
 
         if (_config.MaxTicketPatienceInSec <= 0)
         {
@@ -110,7 +112,7 @@ public partial class Matchmaker : IDisposable
         AddBackfill(sessionIds, ownerSessionId, partyId, [(0, query)], properties, minMaxLadder, countMultiple, createdAt);
  
     // callers hold _gate: the checks below and the writes after them are one step
-    private (string Ticket, long CreatedAt) AddTicket(HashSet<string> sessionIds, string ownerSessionId, string partyId, QueryRung[] queryLadder, Dictionary<string, object> properties, MinMaxRung[] minMaxLadder, int minMaxRungCap, int countMultiple, DateTime? createdAt)
+    private (string Ticket, long CreatedAt) AddTicket(HashSet<string> sessionIds, string ownerSessionId, string partyId, QueryRung[] queryLadder, Dictionary<string, object> properties, MinMaxRung[] minMaxLadder, int minMaxRungCap, int countMultiple, DateTime? createdAt, (string Ticket, long CreatedAt)? restored = null)
     {
         if (queryLadder.Length == 0 || minMaxLadder.Length == 0)
         {
@@ -251,10 +253,22 @@ public partial class Matchmaker : IDisposable
             parsedQueryLadder[i] = (queryLadder[i].AtSec, queryStrings[i], parsedQueries[i]);
         }
 
-        string ticket = Guid.NewGuid().ToString();
+        string ticket;
+        long stampedAt;
 
-        long queuedAt = ((createdAt ?? DateTime.UtcNow).Ticks - DateTime.UnixEpoch.Ticks) * 100;
-        long stampedAt = _lastCreatedAt = queuedAt > _lastCreatedAt ? queuedAt : _lastCreatedAt + 1;
+        if (restored is var (restoredTicket, restoredAt))
+        {
+            ticket = restoredTicket;
+            stampedAt = restoredAt;
+            _lastCreatedAt = Math.Max(_lastCreatedAt, restoredAt);
+        }
+        else
+        {
+            ticket = Guid.NewGuid().ToString();
+
+            long queuedAt = ((createdAt ?? DateTime.UtcNow).Ticks - DateTime.UnixEpoch.Ticks) * 100;
+            stampedAt = _lastCreatedAt = queuedAt > _lastCreatedAt ? queuedAt : _lastCreatedAt + 1;
+        }
 
         var index = new MatchmakerTicket
         {
@@ -292,7 +306,39 @@ public partial class Matchmaker : IDisposable
             }
         }
 
+        if (restored == null)
+        {
+            _store?.OnAdd(ToRecord(index));
+        }
+
         return (ticket, stampedAt);
+    }
+
+    public int Restore()
+    {
+        if (_store == null)
+        {
+            throw new InvalidOperationException("Restore needs a ticket store");
+        }
+
+        var records = _store.LoadAll();
+
+        lock (_m)
+        {
+            if (_indexes.Count != 0)
+            {
+                throw new InvalidOperationException("Restore needs an empty pool");
+            }
+
+            foreach (var record in records.OrderBy(r => r.CreatedAt))
+            {
+                AddTicket([.. record.Members], record.OwningSessionId, record.PartyId,
+                    record.QueryLadder, record.Properties, record.MinMaxLadder, _maxLadderRungs,
+                    record.CountMultiple, createdAt: null, restored: (record.Ticket, record.CreatedAt));
+            }
+
+            return records.Count;
+        }
     }
 
     private static void ComputeTicketRung(MatchmakerTicket ticket)
@@ -486,6 +532,7 @@ public partial class Matchmaker : IDisposable
 
         if (activeIndexesCopy.Count == 0)
         {
+            _store?.Flush();
             return new();
         }
 
@@ -514,6 +561,8 @@ public partial class Matchmaker : IDisposable
                 seated.Add(match);
             }
         }
+
+        _store?.Flush();
 
         return seated;
     }
@@ -799,12 +848,14 @@ public partial class Matchmaker : IDisposable
         _index.Delete(index.Ticket);
         _indexes.Remove(index.Ticket);
         _activeIndexes.Remove(index.Ticket);
+        _store?.OnRemove(index.Ticket);
 
         return true;
     }
 
     public void Dispose()
     {
+        _store?.Flush();
         _index.Dispose();
     }
 }

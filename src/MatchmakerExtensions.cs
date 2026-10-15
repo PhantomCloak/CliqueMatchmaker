@@ -62,7 +62,18 @@ public partial class Matchmaker
         }
     }
 
-    static MinMaxRung[] WithSearchingRung(MinMaxRung[] minMaxLadder, int patienceInSec)
+    private static TicketRecord ToRecord(MatchmakerTicket ticket) => new(
+        ticket.Ticket,
+        ticket.OwningSessionId,
+        ticket.PartyId,
+        [.. ticket.Members],
+        ticket.CountMultiple,
+        ticket.CreatedAt,
+        Array.ConvertAll(ticket.QueryLadder, rung => (rung.AtSec, rung.QueryString)),
+        [.. ticket.MinMaxLadder],
+        new Dictionary<string, object>(ticket.Properties, ticket.Properties.Comparer));
+
+    private static MinMaxRung[] WithSearchingRung(MinMaxRung[] minMaxLadder, int patienceInSec)
     {
         if (minMaxLadder.Length == 0)
         {
@@ -79,7 +90,7 @@ public partial class Matchmaker
         return [.. minMaxLadder, (patienceInSec, last.Min, last.Max)];
     }
 
-    static string WithBackfillClause(string query, Query parsed) => parsed switch
+    private static string WithBackfillClause(string query, Query parsed) => parsed switch
     {
         BooleanQuery boolean when boolean.Clauses.Any(clause =>
             clause.Occur == Occur.MUST_NOT && clause.Query is TermQuery term && term.Term.Equals(BackfillTerm)) => query,
